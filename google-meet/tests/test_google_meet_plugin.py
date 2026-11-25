@@ -785,3 +785,92 @@ def test_cmd_install_reports_missing_plugin_dependencies(monkeypatch, capsys):
     from google_meet_plugin import cli
     assert cli._cmd_install(realtime=False, assume_yes=True) == 1
     assert "missing: playwright" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Leaving when the call is over: ended, removed, or everyone else gone
+# ---------------------------------------------------------------------------
+
+_CALL_PAGE_TEXT = {"alone": "You\u2019re the only one here", "ended": "The call has ended",
+                   "removed": "You were removed from the meeting"}
+
+
+class _CallPage:
+    """An admitted bot's Meet tab on a fake clock. *script* maps a start time to what Meet shows
+    from then on: ``"others"`` (people in the call), ``"alone"`` ("You're the only one here"),
+    ``"ended"`` (the left-the-call page) or ``"removed"``."""
+
+    def __init__(self, script, stop, end_at):
+        self.script, self.stop, self.end_at, self.clock = sorted(script.items()), stop, end_at, 0.0
+
+    def shows(self):
+        return [what for at, what in self.script if at <= self.clock][-1]
+
+    def get_by_text(self, pattern):
+        return _Toggle(self, lambda: bool(pattern.search(_CALL_PAGE_TEXT.get(self.shows(), ""))), pattern)
+
+    def get_by_role(self, role, name=None, exact=False):
+        home = self.shows() in {"ended", "removed"} and name == "Return to home screen"
+        return _Toggle(self, lambda: home, name)
+
+    def evaluate(self, _js): return []  # caption drain: nothing new
+    def is_closed(self): return False
+
+    def sleep(self, seconds):
+        self.clock += seconds
+        if self.clock >= self.end_at:
+            self.stop["stop"] = True
+
+
+def _sit_in_call(tmp_path, script, end_at=1800):
+    """Run the drain loop for an already-admitted bot; return (leave reason, seconds in the loop)."""
+    import time
+    from types import SimpleNamespace
+
+    from google_meet_plugin import meet_bot
+    from google_meet_plugin.meet_bot import _BotConfig, _BotState, _drain_loop
+
+    stop = {"stop": False}
+    page = _CallPage(script, stop, end_at)
+    state = _BotState(tmp_path / "out", "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    state.set(in_call=True, joined_at=0.0)
+    clock = SimpleNamespace(time=lambda: page.clock, sleep=page.sleep, strftime=time.strftime,
+                            localtime=time.localtime)
+    with patch.object(meet_bot, "time", clock):
+        _drain_loop(page, _BotConfig(guest_name="Bot", duration_s=0, lobby_timeout=300), state,
+                    {"session": None}, stop)
+    assert json.loads(state.status_path.read_text(encoding="utf-8"))["leaveReason"] == state.leave_reason
+    return state.leave_reason, page.clock
+
+
+def test_bot_leaves_when_the_call_ends(tmp_path):
+    """The drain loop only knew duration, lobby, denial and page loss: an ended call kept the bot
+    on the "call ended" page until ``duration`` ran out."""
+    reason, at = _sit_in_call(tmp_path, {0: "others", 600: "ended"})
+    assert reason == "call_ended" and 600 <= at < 610
+
+
+def test_bot_removed_from_the_call_says_so(tmp_path):
+    reason, at = _sit_in_call(tmp_path, {0: "others", 300: "removed"})
+    assert reason == "removed" and 300 <= at < 310
+
+
+def test_bot_leaves_after_everyone_else_has_gone(tmp_path):
+    from google_meet_plugin.meet_bot import _ALONE_GRACE_S
+
+    reason, at = _sit_in_call(tmp_path, {0: "others", 900: "alone"})
+    assert reason == "alone" and 900 + _ALONE_GRACE_S <= at < 900 + _ALONE_GRACE_S + 10
+
+
+def test_brief_drop_out_and_early_join_do_not_end_the_meeting(tmp_path):
+    from google_meet_plugin.meet_bot import _ALONE_GRACE_S
+
+    # Everyone drops for a minute and comes back: the bot stays, and the wait starts over next time.
+    reason, at = _sit_in_call(tmp_path / "drop", {0: "others", 600: "alone", 660: "others", 1000: "alone"})
+    assert reason == "alone" and 1000 + _ALONE_GRACE_S <= at < 1000 + _ALONE_GRACE_S + 10
+    # A signed-in bot that joins an empty call waits for the others instead of leaving at once.
+    reason, at = _sit_in_call(tmp_path / "early", {0: "alone", 900: "others", 1500: "ended"})
+    assert reason == "call_ended" and at >= 1500
+    # Nobody ever comes: no "alone" exit (only the duration backstop would end it).
+    reason, _ = _sit_in_call(tmp_path / "empty", {0: "alone"}, end_at=1200)
+    assert reason is None

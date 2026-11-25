@@ -47,6 +47,60 @@ def test_is_safe_meet_url_accepts_standard_meet_codes():
     assert _is_safe_meet_url("https://meet.google.com/lookup/ABC123")
 
 
+def test_force_english_ui_pins_hl_and_stays_a_meet_url():
+    """Meet's labels follow the browser/account locale; every probe in the bot matches English (#37781)."""
+    from google_meet_plugin.meet_bot import (
+        _force_english_ui,
+        _is_safe_meet_url,
+        _meeting_id_from_url,
+    )
+
+    assert _force_english_ui("https://meet.google.com/abc-defg-hij") == "https://meet.google.com/abc-defg-hij?hl=en"
+    assert (_force_english_ui("https://meet.google.com/abc-defg-hij?hl=pl&authuser=1")
+            == "https://meet.google.com/abc-defg-hij?hl=en&authuser=1")
+    for url in ("https://meet.google.com/abc-defg-hij", "https://meet.google.com/lookup/some-id",
+                "https://meet.google.com/new"):
+        assert _is_safe_meet_url(_force_english_ui(url))
+    assert _meeting_id_from_url(_force_english_ui("https://meet.google.com/abc-defg-hij")) == "abc-defg-hij"
+
+
+def test_bot_opens_meet_in_english(tmp_path, monkeypatch):
+    """The URL the bot navigates to carries ``hl=en``; the recorded meeting URL stays the one passed in."""
+    import sys
+    import types
+
+    from google_meet_plugin import meet_bot
+
+    visited = []
+
+    class _Page:
+        def goto(self, url, **_kw):
+            visited.append(url)
+            raise RuntimeError("stop after navigation")
+
+    class _Browser:
+        def new_context(self, **_kw):
+            return types.SimpleNamespace(new_page=_Page)
+
+        def close(self): pass
+
+    class _PW:
+        chromium = types.SimpleNamespace(launch=lambda **_kw: _Browser())
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = _PW
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    monkeypatch.setattr(meet_bot, "chromium_executable", lambda: "/usr/bin/chromium")
+    monkeypatch.setenv("HERMES_MEET_URL", "https://meet.google.com/abc-defg-hij")
+    monkeypatch.setenv("HERMES_MEET_OUT_DIR", str(tmp_path / "out"))
+    assert meet_bot.run_bot() == 4  # navigate failed: exits before joining
+    assert visited == ["https://meet.google.com/abc-defg-hij?hl=en"]
+    status = json.loads((tmp_path / "out" / "status.json").read_text(encoding="utf-8"))
+    assert status["url"] == "https://meet.google.com/abc-defg-hij"
+
+
 def test_meeting_id_extraction():
     from google_meet_plugin.meet_bot import _meeting_id_from_url
 

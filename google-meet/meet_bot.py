@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from hermes_cli.browser_runtime import chromium_executable
 from utils import atomic_json_write
@@ -37,6 +38,16 @@ _FFMPEG_MISSING = "ffmpeg not found — install via `brew install ffmpeg` for re
 def _is_safe_meet_url(url: str) -> bool:
     """True if *url* is a Google Meet URL we're willing to navigate to."""
     return isinstance(url, str) and bool(MEET_URL_RE.match(url.strip()))
+
+
+def _force_english_ui(url: str) -> str:
+    """*url* with Google's ``hl=en``, so Meet renders its English UI whatever the browser or account
+    locale: every label this bot matches (join buttons, waiting room, denial, leave, captions) is English.
+    Caption language is a separate, per-participant Meet setting and is not affected."""
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query))
+    query["hl"] = "en"
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 def _meeting_id_from_url(url: str) -> str:
@@ -641,7 +652,7 @@ def run_bot() -> int:
             context = browser.new_context(**context_args)
             page = context.new_page()
             try:
-                page.goto(cfg.url, wait_until="domcontentloaded", timeout=30_000)
+                page.goto(_force_english_ui(cfg.url), wait_until="domcontentloaded", timeout=30_000)
             except Exception as e:
                 state.set(error=f"navigate failed: {e}", exited=True)
                 return 4

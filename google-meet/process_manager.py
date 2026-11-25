@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -67,6 +68,35 @@ _BOT_BOOTSTRAP = (
     "import runpy, sys, types; pkg = types.ModuleType('google_meet_plugin'); pkg.__path__ = [sys.argv[1]]; "
     "sys.modules['google_meet_plugin'] = pkg; runpy.run_module('google_meet_plugin.meet_bot', run_name='__main__')"
 )
+_PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?w?(?:\.exe)?")
+
+
+def _bot_argv() -> list[str]:
+    return [sys.executable, "-P", "-c", _BOT_BOOTSTRAP, str(Path(__file__).resolve().parent)]
+
+
+def _pid_is_recorded_bot(pid: int, record: dict[str, Any]) -> bool:
+    """Whether *pid* is still the bot *record* started, so a pid the OS reused is never signalled.
+    Start fingerprints are opaque host-native values, not wall-clock seconds; a record with one fails
+    closed when the live value differs or cannot be read."""
+    if not _pid_alive(pid):
+        return False
+    from gateway.status import get_process_start_time
+
+    recorded_start = record.get("pid_start_time")
+    if recorded_start is not None:
+        return type(recorded_start) is int and get_process_start_time(pid) == recorded_start
+    # A record from before the fingerprint: match the exact bot argv, this plugin's bootstrap or core's
+    # bundled ``-m plugins.google_meet.meet_bot``. Another process merely mentioning meet_bot is left alone.
+    import psutil
+
+    try:
+        argv = psutil.Process(pid).cmdline()
+    except psutil.Error:
+        return False
+    if not argv or _PYTHON_RE.fullmatch(Path(argv[0]).name.lower()) is None:
+        return False
+    return argv[1:] in (_bot_argv()[1:], ["-m", "plugins.google_meet.meet_bot"])
 
 
 def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
@@ -115,12 +145,14 @@ def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
     log_path = out / "bot.log"
     # Detach: stdout/stderr → log file, new session so parent signals don't propagate.
     with open(log_path, "ab", buffering=0) as log_fh:
-        proc = subprocess.Popen([sys.executable, "-P", "-c", _BOT_BOOTSTRAP, str(Path(__file__).resolve().parent)],
+        proc = subprocess.Popen(_bot_argv(),
                                 stdin=subprocess.DEVNULL,
                                 # detached-spawn: ok — reached via files across turns, stopped by meet_leave (pid in .active.json)
                                 stdout=log_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True,
                                 close_fds=True)
-    record = {"pid": proc.pid, "meeting_id": meeting_id, "out_dir": str(out), "url": url,
+    from gateway.status import get_process_start_time
+    record = {"pid": proc.pid, "pid_start_time": get_process_start_time(proc.pid),
+              "meeting_id": meeting_id, "out_dir": str(out), "url": url,
               "started_at": time.time(), "session_id": session_id, "log_path": str(log_path), "mode": mode}
     _write_active(record)
     return {"ok": True, **record}
@@ -132,7 +164,7 @@ def status() -> dict[str, Any]:
     if not active:
         return dict(_NO_ACTIVE)
     pid = int(active.get("pid", 0))
-    alive = _pid_alive(pid) if pid else False
+    alive = _pid_is_recorded_bot(pid, active) if pid else False
 
     status_path = Path(active.get("out_dir", "")) / "status.json"
     bot_status: dict[str, Any] = {}
@@ -205,14 +237,15 @@ def stop(*, reason: str = "requested") -> dict[str, Any]:
         return dict(_NO_ACTIVE)
     pid = int(active.get("pid", 0))
     out_dir = active.get("out_dir")
-    if _pid_alive(pid):
+    if _pid_is_recorded_bot(pid, active):
         _kill(pid, signal.SIGTERM)
         for _ in range(20):
-            if not _pid_alive(pid):
+            if not _pid_is_recorded_bot(pid, active):
                 break
             time.sleep(0.5)
         else:
-            _kill(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only plugin (google_meet registers no-op on Windows; see __init__.py)
+            if _pid_is_recorded_bot(pid, active):
+                _kill(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only plugin (google_meet registers no-op on Windows; see __init__.py)
     _active_file().unlink(missing_ok=True)
     return {"ok": True, "reason": reason, "meetingId": active.get("meeting_id"),
             "transcriptPath": str(Path(out_dir) / "transcript.txt") if out_dir else None}

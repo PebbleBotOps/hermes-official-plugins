@@ -26,7 +26,7 @@ The user says any of:
 
 | Mode | What the bot does |
 |---|---|
-| `transcribe` (default) | Joins, enables captions, scrapes a transcript. Listen-only. |
+| `transcribe` (default) | Joins with camera and mic off, enables captions once admitted, scrapes a transcript. Listen-only. |
 | `realtime` | Same as transcribe PLUS speaks into the meeting via OpenAI Realtime. The agent calls `meet_say(text)` and the bot's voice comes out of the call. |
 
 Pick `realtime` only when the user actually wants the agent to speak. It costs real money (OpenAI Realtime is pay-per-audio-minute) and requires a virtual audio device set up on the machine running the bot.
@@ -120,6 +120,7 @@ Run `hermes meet setup` to preflight local prereqs.
 | `lobbyWaiting` | Clicked "Ask to join", waiting on host. |
 | `joinAttemptedAt` / `joinedAt` | Timestamps for lobby-click and actual admission. |
 | `captioning` | Caption observer is installed. |
+| `captionsOn` | Meet's live captions are on (turned on after admission; English Meet UI). |
 | `transcriptLines` / `lastCaptionAt` | Transcript progress. |
 | `realtime` / `realtimeReady` | Realtime mode provisioned / WS connected. |
 | `realtimeDevice` | Audio device name the bot is feeding (e.g. `hermes_meet_src`). |

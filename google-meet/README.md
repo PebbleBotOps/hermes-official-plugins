@@ -106,6 +106,8 @@ Incoming speech is still the caption scrape (v1) — meeting audio is never sent
 Realtime session, so there is no barge-in on raw audio and no STT billing. After
 admission the bot unmutes itself if Meet seated it muted; `status.json` / `hermes meet
 status` report the result as `micState` (`unmuted`, `unmuted_clicked`, `unknown`).
+Transcribe mode turns the camera and the mic off before joining and never unmutes
+(`micState` `muted`); realtime turns only the camera off.
 
 ## Remote node host
 

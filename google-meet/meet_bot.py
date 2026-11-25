@@ -56,6 +56,7 @@ def _quiet(fn, *args, **kwargs):
 _STATUS_FIELDS = (
     ("meetingId", "meeting_id", None), ("url", "url", None), ("inCall", "in_call", False),
     ("captioning", "captioning", False), ("captionsEnabledAttempted", "captions_enabled_attempted", False),
+    ("captionsOn", "captions_on", False),
     ("lobbyWaiting", "lobby_waiting", False), ("joinAttemptedAt", "join_attempted_at", None),
     ("joinedAt", "joined_at", None), ("lastCaptionAt", "last_caption_at", None),
     ("transcriptLines", "transcript_lines", 0), ("transcriptPath", "transcript_path", None),
@@ -160,10 +161,16 @@ _CAPTION_OBSERVER_JS = r"""
 })();
 """
 
-# Best-effort caption toggle: Meet binds it to the ``c`` key; click targeting is too brittle.
-_ENABLE_CAPTIONS_JS = (
-    "(() => { document.body.dispatchEvent(new KeyboardEvent('keydown', "
-    "{ key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true })); return true; })();")
+# Captions are turned on after admission by a real (trusted) Playwright click on the toolbar toggle while it
+# offers the positive action. A synthetic ``KeyboardEvent`` is ``isTrusted: false`` and Meet ignores it, and in
+# the lobby there is no toggle yet. Its label flips to "Turn off captions" once they are on. English only.
+_CAPTIONS_ON_RE = re.compile(r"Turn on captions", re.IGNORECASE)
+_CAPTIONS_OFF_RE = re.compile(r"Turn off captions", re.IGNORECASE)
+
+# The waiting room also has a "Leave call" button, so the admission probe alone reported ``inCall`` while the
+# bot still waited for the host. English only, like ``_DENIED_PROBE_JS``.
+_LOBBY_TEXT_RE = re.compile(
+    r"Asking to join|when someone lets you in|until a meeting host brings you into the call", re.IGNORECASE)
 
 _LEAVE_CALL_JS = (
     "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
@@ -352,8 +359,44 @@ def _config_from_env() -> _BotConfig:
         lobby_timeout=float(env("HERMES_MEET_LOBBY_TIMEOUT", "300")))
 
 
-def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> None:
-    """Fill the guest-name field and click 'Join now' / 'Ask to join' (the latter → lobby_waiting).
+def _mute_local_av(page, *, keep_mic: bool) -> str:
+    """Turn the camera off, and the microphone too unless realtime needs it. Chromium's fake capture
+    device (``--use-fake-device-for-media-stream``) shows everyone a green test pattern and its
+    microphone plays a test tone. Clicks a toggle only while it offers "Turn off …", so it never turns
+    a device on; Meet uses the same labels on the pre-join screen and in the call. Returns the mic
+    state for status: ``muted`` / ``live`` / ``unknown`` (toggle not found or localized)."""
+    devices = ("camera",) if keep_mic else ("camera", "microphone")
+    for device in devices:
+        live = _visible(page.get_by_role("button", name=re.compile(rf"Turn off {device}", re.IGNORECASE)))
+        if live is not None:
+            _quiet(live.click, timeout=2_000)
+    if keep_mic:
+        return "live"
+    if _visible(page.get_by_role("button", name=re.compile(r"Turn on microphone", re.IGNORECASE))) is not None:
+        return "muted"
+    return "unknown"
+
+
+def _in_lobby(page) -> bool:
+    """True while Meet shows the waiting-room text (the bot asked to join and nobody let it in yet)."""
+    return _visible(page.get_by_text(_LOBBY_TEXT_RE)) is not None
+
+
+def _enable_captions(page) -> bool | None:
+    """Turn live captions on with a trusted click on the toggle while it reads "Turn on captions".
+    True: they are on (the toggle offers "Turn off captions"); False: clicked now, check again later;
+    None: no toggle visible yet. Never clicks the toggle when it would turn captions off."""
+    if _visible(page.get_by_role("button", name=_CAPTIONS_OFF_RE)) is not None:
+        return True
+    toggle = _visible(page.get_by_role("button", name=_CAPTIONS_ON_RE))
+    if toggle is not None and _quiet(lambda: (toggle.click(timeout=3_000), True)):
+        return False
+    return None
+
+
+def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0, *, keep_mic: bool = False) -> None:
+    """Fill the guest-name field, turn the camera (and, unless *keep_mic*, the mic) off, and click
+    'Join now' / 'Ask to join' (the latter → lobby_waiting).
     Meet renders the pre-join buttons asynchronously after ``domcontentloaded``, so poll for up to
     *timeout* seconds instead of checking once — a single miss leaves the bot silently in the lobby."""
     deadline = time.time() + timeout
@@ -363,6 +406,8 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
             _quiet(name_box.fill, cfg.guest_name, timeout=2_000)
         for label in ("Join now", "Ask to join"):
             btn = _visible(page.get_by_role("button", name=label, exact=False))
+            if btn is not None:
+                _mute_local_av(page, keep_mic=keep_mic)
             if btn is not None and _quiet(lambda: (btn.click(timeout=3_000), True)):
                 if label == "Ask to join":
                     state.set(lobby_waiting=True)
@@ -387,10 +432,13 @@ def _ensure_mic_on(page) -> str:
 
 def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: dict) -> None:
     """Admission + caption drain loop until SIGTERM, duration expiry, lobby timeout/denial or page loss.
-    Sets ``leave_reason`` for every exit but SIGTERM; triggers barge-in; mirrors realtime counters."""
+    Sets ``leave_reason`` for every exit but SIGTERM; triggers barge-in; mirrors realtime counters.
+    Once admitted it turns captions on (retrying until the toggle reads "Turn off captions"); the mic is
+    unmuted only for realtime."""
     deadline = (time.time() + cfg.duration_s) if cfg.duration_s else None
     lobby_deadline = time.time() + cfg.lobby_timeout
-    last_admission_check = 0.0
+    last_admission_check = last_captions_check = 0.0
+    realtime = bool(rt.get("enabled"))
     while not stop_flag["stop"]:
         now = time.time()
         if deadline and now > deadline:
@@ -398,8 +446,10 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             return
         if not state.in_call and (now - last_admission_check) > 3.0:
             last_admission_check = now
-            if _probe(page, _ADMISSION_PROBE_JS):
-                state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=_ensure_mic_on(page))
+            if not _in_lobby(page) and _probe(page, _ADMISSION_PROBE_JS):
+                mic_state = _mute_local_av(page, keep_mic=realtime)  # again in the call: pre-join may have missed
+                state.set(in_call=True, lobby_waiting=False, joined_at=now,
+                          mic_state=_ensure_mic_on(page) if realtime else mic_state)
             elif now > lobby_deadline:
                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
                 state.set(error=f"lobby timeout — host never admitted the bot within {waited}s",
@@ -408,6 +458,11 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             elif _probe(page, _DENIED_PROBE_JS):
                 state.set(error="host denied admission", leave_reason="denied")
                 return
+        if state.in_call and not state.captions_on and (now - last_captions_check) > 5.0:
+            last_captions_check = now
+            captions = _enable_captions(page)
+            if captions is not None:
+                state.set(captions_on=captions, captions_enabled_attempted=True)
         try:
             queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):
@@ -484,9 +539,7 @@ def run_bot() -> int:
             except Exception as e:
                 state.set(error=f"navigate failed: {e}", exited=True)
                 return 4
-            _join(page, cfg, state)
-            if _quiet(page.evaluate, _ENABLE_CAPTIONS_JS):
-                state.set(captions_enabled_attempted=True)
+            _join(page, cfg, state, keep_mic=rt["enabled"])
             try:
                 page.evaluate(_CAPTION_OBSERVER_JS)
             except Exception as e:

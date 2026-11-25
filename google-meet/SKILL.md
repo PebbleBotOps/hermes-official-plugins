@@ -125,7 +125,7 @@ Run `hermes meet setup` to preflight local prereqs.
 | `realtimeDevice` | Audio device name the bot is feeding (e.g. `hermes_meet_src`). |
 | `audioBytesOut` / `lastAudioOutAt` | How much PCM the OpenAI session has produced. |
 | `lastBargeInAt` | Timestamp of the most recent `response.cancel` sent. |
-| `leaveReason` | `duration_expired`, `lobby_timeout`, `denied`, `page_closed`, or null. |
+| `leaveReason` | `duration_expired`, `lobby_timeout`, `denied`, `call_ended` (the call is over), `removed` (a participant removed the bot), `alone` (everyone else left 2 minutes ago), `page_closed`, or null. |
 | `error` | Last error (soft — bot may still be running). |
 
 ## Transcript location

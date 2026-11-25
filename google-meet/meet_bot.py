@@ -188,6 +188,28 @@ _DENIED_PROBE_JS = r"""
     })();
     """
 
+# English only — what Meet shows once the bot is out of a call it was in: removed by a participant, or the
+# call is over (the host ended it for everyone, or the tab left it). The page then offers "Return to home screen".
+_REMOVED_TEXT_RE = re.compile(r"You were removed from the meeting|You[’']ve been removed from the meeting",
+                              re.IGNORECASE)
+_CALL_ENDED_TEXT_RE = re.compile(
+    r"You left the meeting|You[’']ve left the meeting|(?:The|This) (?:call|meeting) has ended|"
+    r"ended the meeting for everyone", re.IGNORECASE)
+# Meet's own line on the stage while nobody else is in the call. Meet may print a typographic apostrophe.
+_ALONE_TEXT_RE = re.compile(r"You[’']re the only one here", re.IGNORECASE)
+# Everyone else gone this long → the meeting is over for the bot; a brief drop-out and rejoin stays in.
+_ALONE_GRACE_S = 120.0
+
+
+def _out_of_call(page) -> str | None:
+    """``removed`` / ``call_ended`` once Meet shows the bot is out of the call it was in, else None."""
+    if _visible(page.get_by_text(_REMOVED_TEXT_RE)) is not None:
+        return "removed"
+    if (_visible(page.get_by_text(_CALL_ENDED_TEXT_RE)) is not None
+            or _visible(page.get_by_role("button", name="Return to home screen")) is not None):
+        return "call_ended"
+    return None
+
 
 def _probe(page, js: str) -> bool:
     """Evaluate a boolean JS probe; conservative — False on any error."""
@@ -386,16 +408,33 @@ def _ensure_mic_on(page) -> str:
 
 
 def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: dict) -> None:
-    """Admission + caption drain loop until SIGTERM, duration expiry, lobby timeout/denial or page loss.
-    Sets ``leave_reason`` for every exit but SIGTERM; triggers barge-in; mirrors realtime counters."""
+    """Admission + caption drain loop until SIGTERM, duration expiry, lobby timeout/denial, the call
+    ending (removed, ended, or everyone else gone for ``_ALONE_GRACE_S``) or page loss.
+    Sets ``leave_reason`` for every exit but SIGTERM; triggers barge-in; mirrors realtime counters.
+    "Alone" counts only after someone else was seen in the call, so a bot that joins an empty call
+    early waits for the others."""
     deadline = (time.time() + cfg.duration_s) if cfg.duration_s else None
     lobby_deadline = time.time() + cfg.lobby_timeout
-    last_admission_check = 0.0
+    last_admission_check = last_presence_check = 0.0
+    others_seen, alone_since = False, None
     while not stop_flag["stop"]:
         now = time.time()
         if deadline and now > deadline:
             state.set(leave_reason="duration_expired")
             return
+        if state.in_call and (now - last_presence_check) > 3.0:
+            last_presence_check = now
+            out = _out_of_call(page)
+            if out is not None:
+                state.set(leave_reason=out)
+                return
+            if _visible(page.get_by_text(_ALONE_TEXT_RE)) is None:
+                others_seen, alone_since = True, None
+            elif others_seen:
+                alone_since = alone_since or now
+                if now - alone_since >= _ALONE_GRACE_S:
+                    state.set(leave_reason="alone")
+                    return
         if not state.in_call and (now - last_admission_check) > 3.0:
             last_admission_check = now
             if _probe(page, _ADMISSION_PROBE_JS):

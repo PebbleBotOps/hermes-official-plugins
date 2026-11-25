@@ -7,7 +7,8 @@ Covers the safety-gated pieces that don't require Playwright:
   * Status / transcript writes round-trip through the file-backed state
   * Tool handlers return well-formed JSON under all branches
   * Process manager refuses unsafe URLs and clears stale state cleanly
-  * ``_on_session_end`` hook is defensive (no-ops when no bot active)
+  * ``_on_session_finalize`` hook is defensive (no-ops when no bot active) and only stops the bot
+    for the conversation that joined
 
 Does NOT spawn a real Chromium — we mock ``subprocess.Popen`` where needed.
 """
@@ -18,6 +19,7 @@ import json
 import os
 import signal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -181,15 +183,125 @@ def test_meet_join_handler_missing_url_returns_error():
 
 
 # ---------------------------------------------------------------------------
-# _on_session_end — defensive cleanup
+# _on_session_finalize — defensive cleanup, only for the conversation that joined
 # ---------------------------------------------------------------------------
 
-def test_on_session_end_noop_when_nothing_active():
-    from google_meet_plugin import _on_session_end
+def test_on_session_finalize_noop_when_nothing_active():
+    from google_meet_plugin import _on_session_finalize
     # Should not raise and should not call stop().
     with patch("google_meet_plugin.pm.stop") as stop_mock:
-        _on_session_end()
+        _on_session_finalize(session_id="s1")
     stop_mock.assert_not_called()
+
+
+def test_bot_outlives_turns_and_other_sessions(monkeypatch):
+    """meet_join returns at once and the bot must keep running across turns; only the end of the
+    session that joined the call may stop it (on_session_end fires after every turn)."""
+    import importlib
+
+    plugin = importlib.import_module("google_meet_plugin")
+    from google_meet_plugin import process_manager as pm
+    from google_meet_plugin.tools import handle_meet_join
+
+    hooks = {}
+    ctx = SimpleNamespace(register_tool=lambda **_k: None, register_cli_command=lambda **_k: None,
+                          register_hook=lambda name, fn: hooks.setdefault(name, []).append(fn))
+    monkeypatch.setattr(plugin, "_core_ships_google_meet", lambda: False)
+    monkeypatch.setattr(plugin.platform, "system", lambda: "Linux")
+    plugin.register(ctx)
+
+    def _fake_start(**kw):
+        pm._write_active({"pid": 4242, "meeting_id": "abc-defg-hij", "out_dir": "/nonexistent",
+                          "url": kw["url"], "started_at": 0, "session_id": kw.get("session_id")})
+        return {"ok": True}
+
+    with patch.object(pm, "start", side_effect=_fake_start), \
+            patch("google_meet_plugin.tools.check_meet_requirements", return_value=True):
+        handle_meet_join({"url": "https://meet.google.com/abc-defg-hij"}, session_id="s1")
+    assert pm.status()["sessionId"] == "s1"
+
+    def _fire(name, **kw):
+        for fn in hooks.get(name, []):
+            fn(**kw)
+
+    real_status = pm.status  # the bot is alive however liveness is checked; the hook decides on ownership
+    with patch.object(pm, "status", lambda: {**real_status(), "alive": True}), \
+            patch.object(pm, "stop") as stop_mock:
+        _fire("on_session_end", session_id="s1", completed=True, interrupted=False)
+        _fire("on_session_finalize", session_id="s2")
+        stop_mock.assert_not_called()
+        _fire("on_session_finalize", session_id="s1")
+        stop_mock.assert_called_once()
+
+
+def test_bot_follows_its_conversation_across_compression():
+    """Compression rotates the session id mid-meeting: finalizing the continuation still ends the
+    conversation that joined the call, while an unrelated session's end leaves the bot alone."""
+    import google_meet_plugin as plugin
+    from google_meet_plugin import process_manager as pm
+    from persistence.conversation.sessions import NewSession
+    from persistence_assembly import open_persistence, profile_scope
+
+    store = open_persistence(profile_scope())  # the per-test HERMES_HOME's store
+    try:
+        store.sessions.create(NewSession(session_id="root", source="cli"))
+        store.sessions.end("root", "compression")
+        store.sessions.create(NewSession(session_id="tip", source="cli", parent_session_id="root"))
+        store.sessions.create(NewSession(session_id="other", source="cli"))
+    finally:
+        store.close()
+    pm._write_active({"pid": 4242, "meeting_id": "abc-defg-hij", "out_dir": "/nonexistent",
+                      "url": "https://meet.google.com/abc-defg-hij", "started_at": 0, "session_id": "root"})
+
+    real_status = pm.status
+    with patch.object(pm, "status", lambda: {**real_status(), "alive": True}), \
+            patch.object(pm, "stop") as stop_mock:
+        plugin._on_session_finalize(session_id="other")
+        stop_mock.assert_not_called()
+        plugin._on_session_finalize(session_id="tip")
+        stop_mock.assert_called_once()
+
+
+@pytest.mark.platforms("posix")
+def test_served_profile_bot_never_gets_the_launch_profiles_env(monkeypatch, tmp_path):
+    """Profile B has no OpenAI key: its bot carries neither launch profile A's key nor A's home,
+    and still gets the import path it needs to run this interpreter."""
+    from agent.secret_scope import (
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
+    from google_meet_plugin import process_manager as pm
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch = tmp_path / ".hermes"
+    served = launch / "profiles" / "b"
+    served.mkdir(parents=True)
+    (launch / ".env").write_text("OPENAI_API_KEY=sk-launch-profile\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-launch-profile")  # launch .env loaded at boot
+    monkeypatch.setenv("PYTHONPATH", "/opt/hermes-agent")  # launcher-composed import path
+    captured = {}
+
+    class _FakeProc:
+        pid = 4244
+
+    monkeypatch.setattr(pm.subprocess, "Popen", lambda cmd, **kw: (captured.update(kw["env"]), _FakeProc())[1])
+
+    set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(served))
+    scope_token = set_secret_scope({}, profile_home=str(served))
+    try:
+        assert pm.start("https://meet.google.com/abc-defg-hij", mode="realtime")["ok"] is True
+    finally:
+        reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+        set_multiplex_active(False)
+
+    assert "OPENAI_API_KEY" not in captured
+    assert "HERMES_MEET_REALTIME_KEY" not in captured
+    assert captured["HERMES_HOME"] == str(served)
+    assert "/opt/hermes-agent" in captured["PYTHONPATH"].split(os.pathsep)
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +331,7 @@ def test_register_on_a_core_without_the_bundled_copy(monkeypatch):
     ctx = _RegisterCtx()
     plugin.register(ctx)
     assert set(ctx.tools) == {"meet_join", "meet_leave", "meet_status", "meet_transcript", "meet_say"}
-    assert ctx.cli_commands == ["meet"] and ctx.hooks == ["on_session_end"]
+    assert ctx.cli_commands == ["meet"] and ctx.hooks == ["on_session_finalize"]
 
 
 def test_register_stays_inert_on_a_core_that_still_bundles_google_meet(monkeypatch, tmp_path):

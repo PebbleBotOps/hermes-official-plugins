@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 from pathlib import Path
 from types import SimpleNamespace
@@ -439,6 +440,9 @@ def test_join_polls_for_late_button_and_admission_unmutes_mic(tmp_path):
         def get_by_role(self, role, name=None, exact=False):
             return _Toggle(self, lambda: name == "Join now" and time.time() >= self.ready_at, name)
 
+        def get_by_text(self, text):  # no waiting-room text: the host let the bot straight in
+            return _Toggle(self, lambda: False, text)
+
         def evaluate(self, js):  # admitted immediately; the caption drain ends the loop after one pass
             if js is _ADMISSION_PROBE_JS:
                 return True
@@ -453,7 +457,7 @@ def test_join_polls_for_late_button_and_admission_unmutes_mic(tmp_path):
         state = _BotState(tmp_path / str(mic_muted), "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
         with patch("google_meet_plugin.meet_bot.time.sleep"):
             _drain_loop(page, _BotConfig(guest_name="Bot", duration_s=0, lobby_timeout=30), state,
-                        {"session": None}, stop)
+                        {"session": None, "enabled": True}, stop)
         assert state.in_call is True
         return page, state
 
@@ -470,6 +474,138 @@ def test_join_polls_for_late_button_and_admission_unmutes_mic(tmp_path):
     # Control: an already-live mic is reported, never toggled off.
     live, state = admitted(mic_muted=False)
     assert state.mic_state == "unmuted" and live.clicked == []
+
+
+# ---------------------------------------------------------------------------
+# Listen-only join: camera/mic off, in the call only after the waiting room, captions by a real click
+# ---------------------------------------------------------------------------
+
+class _MeetPage:
+    """A Meet tab as the bot sees it: pre-join screen → waiting room → call, on a fake clock.
+
+    Toggles are labelled by the action they offer, as Meet labels them ("Turn off camera" while it
+    is on). The waiting room already has a "Leave call" button, so the admission probe is True
+    there too (#118049 §1). Clicks flip the toggle and are recorded."""
+
+    def __init__(self, *, admit_at, stop, end_at, captions_on=False):
+        self.clock, self.admit_at, self.stop, self.end_at = 0.0, admit_at, stop, end_at
+        self.devices = {"camera": True, "microphone": True}  # Chromium's fake device: both live
+        self.asked, self.captions_on, self.clicked = False, captions_on, []
+
+    def phase(self):
+        if not self.asked:
+            return "prejoin"
+        return "call" if self.clock >= self.admit_at else "lobby"
+
+    def _labels(self):
+        labels = {"Ask to join": lambda: setattr(self, "asked", True)} if self.phase() == "prejoin" else {}
+        for device, live in self.devices.items():
+            labels[f"Turn {'off' if live else 'on'} {device}"] = (
+                lambda d=device: self.devices.__setitem__(d, not self.devices[d]))
+        if self.phase() == "call":
+            labels[f"Turn {'off' if self.captions_on else 'on'} captions"] = (
+                lambda: setattr(self, "captions_on", not self.captions_on))
+        return labels
+
+    def _match(self, name):
+        for label, action in self._labels().items():
+            if (name.search(label) if hasattr(name, "search") else label == name):
+                return label, action
+        return None
+
+    def get_by_role(self, role, name=None, exact=False):
+        page = self
+
+        class _Btn(_Toggle):
+            def click(self, timeout=None):
+                found = page._match(name)
+                page.clicked.append(found[0])
+                found[1]()
+
+        return _Btn(self, lambda: role == "button" and self._match(name) is not None, name)
+
+    def get_by_text(self, text):
+        waiting = "Asking to join… You'll join the call when someone lets you in"
+        return _Toggle(self, lambda: self.phase() == "lobby" and bool(text.search(waiting)), text)
+
+    def locator(self, sel):  # guest-name box (pre-join) and the realtime mic toggles
+        if "name" in sel:
+            box = _Toggle(self, lambda: self.phase() == "prejoin", sel)
+            box.fill = lambda *_a, **_k: None
+            return box
+        return self.get_by_role("button", name=re.compile(re.escape(sel.split('*="')[1].split('"')[0]), re.IGNORECASE))
+
+    def evaluate(self, js):
+        from google_meet_plugin.meet_bot import _ADMISSION_PROBE_JS, _DENIED_PROBE_JS
+        if js is _ADMISSION_PROBE_JS:
+            return self.phase() in {"lobby", "call"}  # "Leave call" is there in both
+        if js is _DENIED_PROBE_JS:
+            return False
+        return []  # caption drain: nobody spoke
+
+    def is_closed(self): return False
+
+    def sleep(self, seconds):
+        self.clock += seconds
+        if self.clock >= self.end_at:
+            self.stop["stop"] = True
+
+
+def _run_meeting(tmp_path, *, admit_at, end_at, realtime=False, captions_on=False):
+    import time
+    from types import SimpleNamespace
+
+    from google_meet_plugin import meet_bot
+    from google_meet_plugin.meet_bot import _BotConfig, _BotState, _drain_loop, _join
+
+    stop = {"stop": False}
+    page = _MeetPage(admit_at=admit_at, stop=stop, end_at=end_at, captions_on=captions_on)
+    state = _BotState(tmp_path / "out", "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    clock = SimpleNamespace(time=lambda: page.clock, sleep=page.sleep, strftime=time.strftime,
+                            localtime=time.localtime)
+    with patch.object(meet_bot, "time", clock):
+        _join(page, _BotConfig(guest_name="Bot"), state, timeout=5.0, keep_mic=realtime)
+        _drain_loop(page, _BotConfig(guest_name="Bot", duration_s=0, lobby_timeout=300), state,
+                    {"session": None, "enabled": realtime}, stop)
+    return page, state
+
+
+def test_transcribe_join_turns_camera_and_mic_off_before_asking(tmp_path):
+    """Chromium's fake device would show the green test pattern and play its test tone."""
+    page, state = _run_meeting(tmp_path, admit_at=float("inf"), end_at=1)
+    assert page.clicked == ["Turn off camera", "Turn off microphone", "Ask to join"]
+    assert page.devices == {"camera": False, "microphone": False} and state.lobby_waiting is True
+
+
+def test_waiting_room_is_not_in_the_call(tmp_path):
+    """The waiting room shares the "Leave call" button with the call: no inCall, no caption clicks."""
+    _, state = _run_meeting(tmp_path, admit_at=float("inf"), end_at=60)
+    assert state.in_call is False and state.lobby_waiting is True
+    assert state.captions_enabled_attempted is False
+    status = json.loads(state.status_path.read_text(encoding="utf-8"))
+    assert status["inCall"] is False and status["lobbyWaiting"] is True
+
+
+def test_admitted_bot_turns_captions_on_once_and_stays_muted(tmp_path):
+    page, state = _run_meeting(tmp_path, admit_at=20, end_at=60)
+    assert state.in_call is True and state.lobby_waiting is False and 20 <= state.joined_at < 25
+    assert page.clicked.count("Turn on captions") == 1 and page.captions_on is True
+    assert state.captions_on is True and state.captions_enabled_attempted is True
+    # Listen-only: the mic is never unmuted in the call.
+    assert page.devices["microphone"] is False and state.mic_state == "muted"
+    assert json.loads(state.status_path.read_text(encoding="utf-8"))["captionsOn"] is True
+
+
+def test_captions_already_on_are_never_toggled_off(tmp_path):
+    page, state = _run_meeting(tmp_path, admit_at=10, end_at=60, captions_on=True)
+    assert state.captions_on is True and page.captions_on is True
+    assert not any("captions" in c for c in page.clicked)
+
+
+def test_realtime_join_keeps_the_mic_for_speech(tmp_path):
+    page, state = _run_meeting(tmp_path, admit_at=10, end_at=30, realtime=True)
+    assert "Turn off microphone" not in page.clicked and page.devices == {"camera": False, "microphone": True}
+    assert state.mic_state == "unmuted"
 
 
 def test_pcm_pump_receives_audio_appended_after_start(tmp_path, monkeypatch):

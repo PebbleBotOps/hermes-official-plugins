@@ -22,5 +22,6 @@ provides_tools:
   - meet_status
   - meet_transcript
   - meet_say
+  - meet_chat
 provides_hooks:
   - on_session_finalize

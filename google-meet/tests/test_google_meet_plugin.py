@@ -339,7 +339,11 @@ def test_bot_follows_its_conversation_across_compression():
 def test_served_profile_bot_never_gets_the_launch_profiles_env(monkeypatch, tmp_path):
     """Profile B has no OpenAI key: its bot carries neither launch profile A's key nor A's home,
     and still gets the import path it needs to run this interpreter."""
-    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from agent.secret_scope import (
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
     from google_meet_plugin import process_manager as pm
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -399,7 +403,7 @@ def test_register_on_a_core_without_the_bundled_copy(monkeypatch):
     monkeypatch.setattr(plugin.platform, "system", lambda: "Linux")
     ctx = _RegisterCtx()
     plugin.register(ctx)
-    assert set(ctx.tools) == {"meet_join", "meet_leave", "meet_status", "meet_transcript", "meet_say"}
+    assert set(ctx.tools) == {"meet_join", "meet_leave", "meet_status", "meet_transcript", "meet_say", "meet_chat"}
     assert ctx.cli_commands == ["meet"] and ctx.hooks == ["on_session_finalize"]
 
 
@@ -874,3 +878,139 @@ def test_brief_drop_out_and_early_join_do_not_end_the_meeting(tmp_path):
     # Nobody ever comes: no "alone" exit (only the duration backstop would end it).
     reason, _ = _sit_in_call(tmp_path / "empty", {0: "alone"}, end_at=1200)
     assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# Meeting chat: meet_chat queues, the admitted bot posts
+# ---------------------------------------------------------------------------
+
+def _active_meeting(tmp_path):
+    from google_meet_plugin import process_manager as pm
+
+    out = tmp_path / "abc-defg-hij"
+    out.mkdir()
+    pm._write_active({"pid": 0, "meeting_id": "abc-defg-hij", "out_dir": str(out),
+                      "url": "https://meet.google.com/abc-defg-hij", "started_at": 0})
+    return out
+
+
+def test_meet_chat_queues_a_message_for_the_bot(tmp_path):
+    from google_meet_plugin import process_manager as pm
+    from google_meet_plugin.tools import handle_meet_chat
+
+    assert pm.enqueue_chat("hello")["ok"] is False  # no meeting
+    out = _active_meeting(tmp_path)
+    assert json.loads(handle_meet_chat({"text": "  "}))["success"] is False
+    assert pm.enqueue_chat("x" * (pm.CHAT_MAX_CHARS + 1))["ok"] is False  # Meet would refuse it
+    res = json.loads(handle_meet_chat({"text": "Hi, I'm taking notes from the captions."}))
+    assert res["success"] is True and res["enqueued_id"]
+    lines = (out / "chat_queue.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(ln)["text"] for ln in lines] == ["Hi, I'm taking notes from the captions."]
+
+
+class _ChatPage:
+    """The call's chat panel: the toolbar toggle opens/closes it; Enter in its box posts."""
+
+    def __init__(self, *, panel_open=False, works=True):
+        self.panel_open, self.works, self.posted, self.clicked, self.typed = panel_open, works, [], [], ""
+        self.on_press = lambda: None
+
+    def locator(self, sel):
+        page = self
+
+        class _Box(_Toggle):
+            def fill(self, text, timeout=None):
+                page.typed = text
+
+            def press(self, key, timeout=None):
+                page.on_press()
+                if not page.works:
+                    raise RuntimeError("Meet did not take the message")
+                page.posted.append(page.typed)
+
+        return _Box(self, lambda: "message" in sel and self.panel_open, sel)
+
+    def get_by_role(self, role, name=None, exact=False):
+        page = self
+
+        class _Btn(_Toggle):
+            def click(self, timeout=None):
+                page.clicked.append(name)
+                page.panel_open = not page.panel_open
+
+        return _Btn(self, lambda: name == "Chat with everyone", name)
+
+
+def _post(page, state, queue, at):
+    import time
+    from types import SimpleNamespace
+
+    from google_meet_plugin import meet_bot
+
+    clock = SimpleNamespace(time=lambda: at, sleep=lambda _s: None, strftime=time.strftime,
+                            localtime=time.localtime)
+    with patch.object(meet_bot, "time", clock):
+        meet_bot._post_queued_chat(page, state, queue)
+
+
+def test_bot_posts_queued_chat_opening_the_panel_only_when_closed(tmp_path):
+    from google_meet_plugin import process_manager as pm
+    from google_meet_plugin.meet_bot import _BotState
+
+    out = _active_meeting(tmp_path)
+    state = _BotState(out, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    pm.enqueue_chat("one")
+    pm.enqueue_chat("two")
+    page = _ChatPage(panel_open=False)
+    _post(page, state, out / "chat_queue.jsonl", at=100.0)
+    assert page.posted == ["one", "two"] and page.clicked == ["Chat with everyone"]  # opened once, left open
+    assert state.last_chat_at == 100.0 and state.chat_error is None
+    assert (out / "chat_queue.jsonl").read_text(encoding="utf-8") == ""
+    assert json.loads(state.status_path.read_text(encoding="utf-8"))["lastChatAt"] == 100.0
+
+
+def test_failed_chat_is_retried_in_order_then_dropped(tmp_path):
+    from google_meet_plugin import process_manager as pm
+    from google_meet_plugin.meet_bot import _BotState
+
+    out = _active_meeting(tmp_path)
+    queue = out / "chat_queue.jsonl"
+    state = _BotState(out, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    first = pm.enqueue_chat("first")["enqueued_id"]
+    pm.enqueue_chat("second")
+    page = _ChatPage(panel_open=True, works=False)
+    page.on_press = lambda: pm.enqueue_chat("third")  # meet_chat runs while the bot posts "first"
+    _post(page, state, queue, at=0.0)        # try 1 of "first"; "second" waits behind it
+    page.on_press = lambda: None
+    assert [json.loads(ln)["text"] for ln in queue.read_text(encoding="utf-8").splitlines()] == [
+        "first", "second", "third"]          # the retries go back ahead of what was queued meanwhile
+    _post(page, state, queue, at=5.0)        # too early to retry: nothing tried
+    _post(page, state, queue, at=11.0)       # try 2
+    assert state.chat_error is None
+    _post(page, state, queue, at=22.0)       # try 3: "first" is dropped, "second" gets its try 1
+    assert first in state.chat_error and state.last_chat_at is None
+    page.works = True
+    _post(page, state, queue, at=33.0)
+    assert page.posted == ["second", "third"] and state.last_chat_at == 33.0
+    assert first in state.chat_error  # the dropped message stays reported
+
+
+def test_chat_waits_for_admission(tmp_path):
+    """Queued before the host lets the bot in: posted only once it is in the call."""
+    from google_meet_plugin import process_manager as pm
+    from google_meet_plugin.meet_bot import _BotConfig, _BotState, _drain_loop
+
+    out = _active_meeting(tmp_path)
+    pm.enqueue_chat("hello")
+    for admitted in (False, True):
+        stop = {"stop": False}
+        page = _ChatPage(panel_open=True)
+        page.evaluate = lambda js, stop=stop: stop.__setitem__("stop", True) or False  # one pass
+        page.get_by_text = lambda _t, page=page: _Toggle(page, lambda: False, _t)
+        page.is_closed = lambda: False
+        state = _BotState(out, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+        state.set(in_call=admitted)
+        with patch("google_meet_plugin.meet_bot.time.sleep"):
+            _drain_loop(page, _BotConfig(guest_name="Bot", duration_s=0, lobby_timeout=300), state,
+                        {"session": None}, stop)
+        assert page.posted == (["hello"] if admitted else [])

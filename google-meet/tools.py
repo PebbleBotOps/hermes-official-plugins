@@ -104,6 +104,14 @@ MEET_SAY_SCHEMA = _schema(
     {"text": _str("Text to speak."), "node": _NODE_PROP},
     required=["text"])
 
+MEET_CHAT_SCHEMA = _schema(
+    "meet_chat",
+    "Post a message in the active Meet call's chat, for everyone in the call to read. Works in transcribe "
+    "and realtime mode. Returns immediately; the bot posts it once it has been let into the call "
+    "(meet_status: lastChatAt, or chatError). Use it to announce yourself; at most 500 characters.",
+    {"text": _str("Message text."), "node": _NODE_PROP},
+    required=["text"])
+
 
 def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
@@ -169,6 +177,13 @@ def handle_meet_transcript(args: dict[str, Any], **_kw) -> str:
 def handle_meet_leave(args: dict[str, Any], **_kw) -> str:
     return _dispatch(args.get("node"), "stop", lambda c: c.stop(),
                      lambda: pm.stop(reason="agent called meet_leave"))
+
+
+def handle_meet_chat(args: dict[str, Any], **_kw) -> str:
+    text = (args.get("text") or "").strip()
+    if not text:
+        return _err("text is required")
+    return _dispatch(args.get("node"), "chat", lambda c: c.chat(text), lambda: pm.enqueue_chat(text))
 
 
 def handle_meet_say(args: dict[str, Any], **_kw) -> str:

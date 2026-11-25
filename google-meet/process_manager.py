@@ -114,7 +114,7 @@ def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
     out = out_dir or (_root() / meeting_id)
     out.mkdir(parents=True, exist_ok=True)
     # Wipe stale files from a previous run of this meeting id.
-    for name in ("transcript.txt", "status.json"):
+    for name in ("transcript.txt", "status.json", "chat_queue.jsonl"):
         with contextlib.suppress(OSError):
             (out / name).unlink()
     # The bot acts for the served profile: its home, none of the launch profile's .env residue, no
@@ -228,6 +228,31 @@ def enqueue_say(text: str) -> dict[str, Any]:
         f.write(json.dumps(entry) + "\n")
     return {"ok": True, "meetingId": active.get("meeting_id"), "enqueued_id": entry["id"],
             "queue_path": str(queue_path)}
+
+
+# Meet refuses longer chat messages.
+CHAT_MAX_CHARS = 500
+
+
+def enqueue_chat(text: str) -> dict[str, Any]:
+    """Append a message for the meeting's chat to ``<out_dir>/chat_queue.jsonl``. The bot posts it once it
+    is in the call (transcribe and realtime alike) and reports ``lastChatAt`` / ``chatError`` in status."""
+    text = (text or "").strip()
+    if not text:
+        return {"ok": False, "reason": "text is required"}
+    if len(text) > CHAT_MAX_CHARS:
+        return {"ok": False, "reason": f"Meet chat messages are at most {CHAT_MAX_CHARS} characters"}
+    active = _read_active()
+    if not active:
+        return dict(_NO_ACTIVE)
+    out_dir = Path(active.get("out_dir", ""))
+    if not out_dir.is_dir():
+        return {"ok": False, "reason": f"out_dir missing: {out_dir}"}
+    queue_path = out_dir / "chat_queue.jsonl"
+    entry = {"id": uuid.uuid4().hex[:12], "text": text}
+    with say_queue_lock(queue_path), queue_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+    return {"ok": True, "meetingId": active.get("meeting_id"), "enqueued_id": entry["id"]}
 
 
 def stop(*, reason: str = "requested") -> dict[str, Any]:

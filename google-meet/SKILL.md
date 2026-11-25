@@ -81,7 +81,7 @@ Run `hermes meet setup` to preflight local prereqs.
 ## Flow
 
 1. **Join** — call `meet_join(url=..., mode=..., node=...)`. Returns immediately.
-2. **Announce yourself** — no auto-consent. Say (in whatever channel the user is watching): "A Hermes agent bot is in this call taking notes."
+2. **Announce yourself** — no auto-consent. Tell the people in the call: `meet_chat(text="...")` posts in the meeting's own chat once the host has let the bot in (e.g. "Hi, I'm Alice's Hermes agent. I'm taking notes from the captions."). Say it in whatever channel the user is watching too.
 3. **Poll** — `meet_status()` for liveness, `meet_transcript(last=20)` for recent captions. Don't re-read the whole transcript every turn.
 4. **Speak (realtime only)** — `meet_say(text="...")` queues text for TTS. The speech lags by ~2s. Don't spam it.
 5. **Leave** — `meet_leave()` when done, or set `duration="30m"` on `meet_join` for auto-leave.
@@ -96,6 +96,7 @@ Run `hermes meet setup` to preflight local prereqs.
 | `meet_transcript` | `last?`, `node?` | Read captions |
 | `meet_leave` | `node?` | Close bot |
 | `meet_say` | `text`, `node?` | Speak in realtime meeting |
+| `meet_chat` | `text`, `node?` | Post in the meeting chat (any mode; ≤ 500 characters) |
 
 `node?` on all tools: pass a registered node name (or `"auto"` for the sole node) to operate a remote bot instead of a local one. Omit for local.
 
@@ -126,6 +127,7 @@ Run `hermes meet setup` to preflight local prereqs.
 | `realtimeDevice` | Audio device name the bot is feeding (e.g. `hermes_meet_src`). |
 | `audioBytesOut` / `lastAudioOutAt` | How much PCM the OpenAI session has produced. |
 | `lastBargeInAt` | Timestamp of the most recent `response.cancel` sent. |
+| `lastChatAt` / `chatError` | Last meeting-chat post; the last message that could not be posted (dropped after 3 tries). |
 | `leaveReason` | `duration_expired`, `lobby_timeout`, `denied`, `call_ended` (the call is over), `removed` (a participant removed the bot), `alone` (everyone else left 2 minutes ago), `page_closed`, or null. |
 | `error` | Last error (soft — bot may still be running). |
 

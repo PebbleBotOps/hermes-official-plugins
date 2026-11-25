@@ -59,5 +59,8 @@ class NodeClient:
     def say(self, text: str) -> dict[str, Any]:
         return self._rpc("say", {"text": str(text)})
 
+    def chat(self, text: str) -> dict[str, Any]:
+        return self._rpc("chat", {"text": str(text)})
+
     def ping(self) -> dict[str, Any]:
         return self._rpc("ping", {})

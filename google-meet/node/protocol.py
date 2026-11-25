@@ -16,7 +16,7 @@ import uuid
 from typing import Any, Dict, Tuple
 
 
-VALID_REQUEST_TYPES = frozenset({"start_bot", "stop", "status", "transcript", "say", "ping"})
+VALID_REQUEST_TYPES = frozenset({"start_bot", "stop", "status", "transcript", "say", "chat", "ping"})
 
 
 def _nonempty_str(value: Any) -> bool:

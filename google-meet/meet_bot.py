@@ -10,6 +10,7 @@ Debug: ``HERMES_MEET_URL=... HERMES_MEET_OUT_DIR=./meet-out HERMES_MEET_HEADED=1
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -64,7 +65,9 @@ _STATUS_FIELDS = (
     ("realtime", "realtime", False), ("realtimeReady", "realtime_ready", False),
     ("realtimeDevice", "realtime_device", None), ("audioBytesOut", "audio_bytes_out", 0),
     ("lastAudioOutAt", "last_audio_out_at", None), ("lastBargeInAt", "last_barge_in_at", None),
-    ("leaveReason", "leave_reason", None), ("micState", "mic_state", None))
+    ("leaveReason", "leave_reason", None), ("micState", "mic_state", None),
+    # meeting chat (meet_chat)
+    ("lastChatAt", "last_chat_at", None), ("chatError", "chat_error", None))
 
 
 class _BotState:
@@ -197,6 +200,69 @@ def _probe(page, js: str) -> bool:
 def _visible(locator):
     """``locator.first`` if it exists and is visible, else None (swallows Playwright errors)."""
     return _quiet(lambda: locator.first if locator.first.count() and locator.first.is_visible() else None)
+
+
+# Meeting chat: the toolbar's "Chat with everyone" toggle opens the panel with a "Send a message" box.
+_CHAT_BUTTON = "Chat with everyone"
+_CHAT_BOX = 'textarea[aria-label*="message" i], div[contenteditable="true"][aria-label*="message" i]'
+_CHAT_ATTEMPTS, _CHAT_RETRY_S = 3, 10.0
+
+
+def _send_chat(page, text: str) -> bool:
+    """Post *text* in the meeting chat: open the panel unless its box is already showing (the toggle
+    would close it), fill the box and press Enter."""
+    box = _visible(page.locator(_CHAT_BOX))
+    if box is None:
+        toggle = _visible(page.get_by_role("button", name=_CHAT_BUTTON, exact=False))
+        if toggle is None or not _quiet(lambda: (toggle.click(timeout=3_000), True)):
+            return False
+        for _ in range(6):  # the panel slides in
+            time.sleep(0.5)
+            if (box := _visible(page.locator(_CHAT_BOX))) is not None:
+                break
+        else:
+            return False
+    return bool(_quiet(lambda: (box.fill(text, timeout=2_000), box.press("Enter", timeout=2_000), True)))
+
+
+def _post_queued_chat(page, state: _BotState, queue_path: Path) -> None:
+    """Take every message ``meet_chat`` queued and post it, in order. A failed message goes back on the
+    queue and is tried again ``_CHAT_RETRY_S`` later (with the ones after it); after ``_CHAT_ATTEMPTS``
+    it is dropped with ``chatError`` set."""
+    try:
+        if queue_path.stat().st_size == 0:
+            return
+    except OSError:
+        return
+    # The same path-keyed lock ``enqueue_chat`` appends under.
+    from ._jsonfile import say_queue_lock
+    with say_queue_lock(queue_path):
+        raw = queue_path.read_text(encoding="utf-8", errors="replace")
+        queue_path.write_text("", encoding="utf-8")
+    retry, now = [], time.time()
+    for line in raw.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        text = str(entry.get("text", "")).strip() if isinstance(entry, dict) else ""
+        if not text:
+            continue
+        if retry or float(entry.get("retry_at", 0) or 0) > now:  # keep the order behind a waiting message
+            retry.append(entry)
+            continue
+        if _send_chat(page, text):
+            state.set(last_chat_at=time.time())
+            continue
+        entry["attempts"] = int(entry.get("attempts", 0) or 0) + 1
+        if entry["attempts"] >= _CHAT_ATTEMPTS:
+            state.set(chat_error=f"chat message {entry.get('id', '')} not posted after {entry['attempts']} tries")
+        else:
+            retry.append({**entry, "retry_at": now + _CHAT_RETRY_S})
+    if retry:  # ahead of anything meet_chat queued meanwhile
+        with say_queue_lock(queue_path):
+            newer = queue_path.read_text(encoding="utf-8", errors="replace") if queue_path.is_file() else ""
+            queue_path.write_text("".join(json.dumps(e) + "\n" for e in retry) + newer, encoding="utf-8")
 
 
 def _pcm_tail_loop(proc, pcm_path: Path, stop_flag: dict, poll_interval: float = 0.05) -> None:
@@ -408,6 +474,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             elif _probe(page, _DENIED_PROBE_JS):
                 state.set(error="host denied admission", leave_reason="denied")
                 return
+        if state.in_call:
+            _post_queued_chat(page, state, state.out_dir / "chat_queue.jsonl")
         try:
             queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):

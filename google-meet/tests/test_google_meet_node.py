@@ -204,3 +204,30 @@ def test_cli_approve_list_remove(capsys):
     assert NodeRegistry().get("mac") is None
 
 
+
+
+def test_chat_travels_to_the_node_and_into_its_queue(monkeypatch):
+    """meet_chat(node=...) reaches the node host's process manager like meet_say does."""
+    from google_meet_plugin.node import protocol, server
+    from google_meet_plugin.node.client import NodeClient
+
+    assert "chat" in protocol.VALID_REQUEST_TYPES
+
+    def reply(raw_out):
+        req = protocol.decode(raw_out)
+        return protocol.encode(protocol.make_response(req["id"], {"ok": True, "echo": req["type"]}))
+
+    holder = _install_fake_ws(monkeypatch, reply)
+    assert NodeClient("ws://remote:1", "tok123").chat("hi all") == {"ok": True, "echo": "chat"}
+    sent = json.loads(holder["ws"].sent[0])
+    assert sent["type"] == "chat" and sent["payload"] == {"text": "hi all"}
+
+    queued = []
+
+    class _PM:
+        def enqueue_chat(self, text):
+            queued.append(text)
+            return {"ok": True}
+
+    assert server._RPC["chat"]({"text": "hi all"}, _PM()) == {"ok": True}
+    assert queued == ["hi all"]

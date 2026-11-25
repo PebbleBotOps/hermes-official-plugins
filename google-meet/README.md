@@ -53,7 +53,7 @@ Without v2: the "realtime" path is skipped; transcribe runs alone.
 | Path | Purpose |
 |---|---|
 | `plugin.yaml` | manifest |
-| `__init__.py` | `register(ctx)` — registers 5 tools + `on_session_end` hook + `hermes meet` CLI |
+| `__init__.py` | `register(ctx)` — registers 6 tools + `on_session_end` hook + `hermes meet` CLI |
 | `meet_bot.py` | Playwright bot subprocess (standalone; `process_manager` spawns it with the plugin directory mounted as a package) |
 | `process_manager.py` | local bot lifecycle + `enqueue_say` |
 | `tools.py` | agent-facing tools + node-routing helper |

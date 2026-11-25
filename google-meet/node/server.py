@@ -57,7 +57,8 @@ _RPC = {
     "stop": lambda p, pm: pm.stop(reason=p.get("reason", "requested")),
     "status": lambda p, pm: pm.status(),
     "transcript": lambda p, pm: pm.transcript(last=p.get("last")),
-    "say": _rpc_say}
+    "say": _rpc_say,
+    "chat": lambda p, pm: pm.enqueue_chat(str(p.get("text", "")))}
 
 
 class NodeServer:

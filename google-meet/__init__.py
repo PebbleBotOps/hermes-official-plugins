@@ -15,9 +15,9 @@ from pathlib import Path
 from . import process_manager as pm
 from .cli import meet_command as _meet_command, register_cli as _register_meet_cli
 from .tools import (
-    MEET_JOIN_SCHEMA, MEET_LEAVE_SCHEMA, MEET_SAY_SCHEMA, MEET_STATUS_SCHEMA, MEET_TRANSCRIPT_SCHEMA,
-    check_meet_requirements, handle_meet_join, handle_meet_leave, handle_meet_say, handle_meet_status,
-    handle_meet_transcript)
+    MEET_CHAT_SCHEMA, MEET_JOIN_SCHEMA, MEET_LEAVE_SCHEMA, MEET_SAY_SCHEMA, MEET_STATUS_SCHEMA,
+    MEET_TRANSCRIPT_SCHEMA, check_meet_requirements, handle_meet_chat, handle_meet_join, handle_meet_leave,
+    handle_meet_say, handle_meet_status, handle_meet_transcript)
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,8 @@ _TOOLS = (
     ("meet_status",     MEET_STATUS_SCHEMA,     handle_meet_status,     "🟢"),
     ("meet_transcript", MEET_TRANSCRIPT_SCHEMA, handle_meet_transcript, "📝"),
     ("meet_leave",      MEET_LEAVE_SCHEMA,      handle_meet_leave,      "👋"),
-    ("meet_say",        MEET_SAY_SCHEMA,        handle_meet_say,        "🗣️"))
+    ("meet_say",        MEET_SAY_SCHEMA,        handle_meet_say,        "🗣️"),
+    ("meet_chat",       MEET_CHAT_SCHEMA,       handle_meet_chat,       "💬"))
 
 
 def _on_session_end(**kwargs) -> None:
